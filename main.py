@@ -4,7 +4,8 @@ import string
 import jsonpickle
 import numpy as np
 import math
-
+import pandas as pd
+import numpy as np
 import json
 from typing import Any
 
@@ -148,8 +149,8 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
-        "reversion_beta": -0.229,
+        "adverse_volume": 31,
+        "reversion_beta": -0.2,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -303,19 +304,44 @@ class Trader:
                     mmmid_price = traderObject["KELP_last_price"]
             else:
                 mmmid_price = (mm_ask + mm_bid) / 2
+            
+            # Step 3: Store midprice history
+            traderObject.setdefault("KELP_midprice_history", [])
+            traderObject["KELP_midprice_history"].append(mmmid_price)
+            if len(traderObject["KELP_midprice_history"]) > 10:
+                traderObject["KELP_midprice_history"].pop(0)
 
-            if traderObject.get("KELP_last_price", None) != None:
+            # Step 4: Calculate volatility
+            vol = self.ewma_volatility(traderObject["KELP_midprice_history"], span=5)
+            vol_threshold = 0.003
+
+            # Step 5: Adjust beta dynamically
+            base_beta = self.params[Product.KELP]["reversion_beta"]
+            if vol > vol_threshold:
+                adjusted_beta = base_beta * 1.75
+            else:
+                adjusted_beta = base_beta * 0.75
+
+            # Optionally store for tracking
+            traderObject["KELP_last_beta"] = adjusted_beta
+
+            # Step 6: Predict fair value
+            if traderObject.get("KELP_last_price") is not None:
                 last_price = traderObject["KELP_last_price"]
                 last_returns = (mmmid_price - last_price) / last_price
-                pred_returns = (
-                    last_returns * self.params[Product.KELP]["reversion_beta"]
-                )
+                pred_returns = last_returns * adjusted_beta
                 fair = mmmid_price + (mmmid_price * pred_returns)
             else:
                 fair = mmmid_price
             traderObject["KELP_last_price"] = mmmid_price
             return fair
         return None
+
+    def ewma_volatility(self, prices, span=10):
+        if len(prices) < 2:
+            return 0.0
+        returns = np.diff(prices) / prices[:-1]
+        return pd.Series(returns).ewm(span=span).std().iloc[-1]
 
     def take_orders(
         self,
