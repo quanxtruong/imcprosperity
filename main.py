@@ -1,14 +1,10 @@
-from datamodel import OrderDepth, UserId, TradingState, Order
-from typing import List
-import string
-import jsonpickle
-import numpy as np
-import math
-import pandas as pd
-import numpy as np
+from typing import Dict, List, Any
+import statistics
 import json
-from typing import Any
-
+import math
+import numpy as np
+import pandas as pd
+import jsonpickle
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
 
@@ -132,6 +128,7 @@ logger = Logger()
 class Product:
     RAINFOREST_RESIN = "RAINFOREST_RESIN"
     KELP = "KELP"
+    SQUID_INK = "SQUID_INK"
 
 
 PARAMS = {
@@ -155,7 +152,12 @@ PARAMS = {
         "join_edge": 0,
         "default_edge": 1,
     },
+    Product.SQUID_INK: {
+        "window_size": 500,
+        "position_limit": 50,
+    }
 }
+
 
 class Trader:
     def __init__(self, params=None):
@@ -163,7 +165,11 @@ class Trader:
             params = PARAMS
         self.params = params
 
-        self.LIMIT = {Product.RAINFOREST_RESIN: 50, Product.KELP: 50}
+        self.LIMIT = {
+            Product.RAINFOREST_RESIN: 50, 
+            Product.KELP: 50,
+            Product.SQUID_INK: 50
+        }
 
     def take_best_orders(
         self,
@@ -243,7 +249,7 @@ class Trader:
         position: int,
         buy_order_volume: int,
         sell_order_volume: int,
-    ) -> List[Order]:
+    ) -> (int, int):
         position_after_take = position + buy_order_volume - sell_order_volume
         fair_for_bid = round(fair_value - width)
         fair_for_ask = round(fair_value + width)
@@ -279,7 +285,7 @@ class Trader:
 
         return buy_order_volume, sell_order_volume
 
-    def KELP_fair_value(self, order_depth: OrderDepth, traderObject) -> float:
+    def KELP_fair_value(self, order_depth: OrderDepth, trader_data) -> float:
         if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
             best_ask = min(order_depth.sell_orders.keys())
             best_bid = max(order_depth.buy_orders.keys())
@@ -298,21 +304,21 @@ class Trader:
             mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
             mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
             if mm_ask == None or mm_bid == None:
-                if traderObject.get("KELP_last_price", None) == None:
+                if trader_data.get("KELP_last_price", None) == None:
                     mmmid_price = (best_ask + best_bid) / 2
                 else:
-                    mmmid_price = traderObject["KELP_last_price"]
+                    mmmid_price = trader_data["KELP_last_price"]
             else:
                 mmmid_price = (mm_ask + mm_bid) / 2
             
             # Step 3: Store midprice history
-            traderObject.setdefault("KELP_midprice_history", [])
-            traderObject["KELP_midprice_history"].append(mmmid_price)
-            if len(traderObject["KELP_midprice_history"]) > 10:
-                traderObject["KELP_midprice_history"].pop(0)
+            trader_data.setdefault("KELP_midprice_history", [])
+            trader_data["KELP_midprice_history"].append(mmmid_price)
+            if len(trader_data["KELP_midprice_history"]) > 10:
+                trader_data["KELP_midprice_history"].pop(0)
 
             # Step 4: Calculate volatility
-            vol = self.ewma_volatility(traderObject["KELP_midprice_history"], span=5)
+            vol = self.ewma_volatility(trader_data["KELP_midprice_history"], span=5)
             vol_threshold = 0.003
 
             # Step 5: Adjust beta dynamically
@@ -323,17 +329,17 @@ class Trader:
                 adjusted_beta = base_beta * 0.75
 
             # Optionally store for tracking
-            traderObject["KELP_last_beta"] = adjusted_beta
+            trader_data["KELP_last_beta"] = adjusted_beta
 
             # Step 6: Predict fair value
-            if traderObject.get("KELP_last_price") is not None:
-                last_price = traderObject["KELP_last_price"]
+            if trader_data.get("KELP_last_price") is not None:
+                last_price = trader_data["KELP_last_price"]
                 last_returns = (mmmid_price - last_price) / last_price
                 pred_returns = last_returns * adjusted_beta
                 fair = mmmid_price + (mmmid_price * pred_returns)
             else:
                 fair = mmmid_price
-            traderObject["KELP_last_price"] = mmmid_price
+            trader_data["KELP_last_price"] = mmmid_price
             return fair
         return None
 
@@ -456,13 +462,155 @@ class Trader:
 
         return orders, buy_order_volume, sell_order_volume
 
+    def trade_squid_ink(self, state: TradingState, trader_data: Dict) -> List[Order]:
+        product = Product.SQUID_INK
+        orders = []
+        
+        if product not in state.order_depths:
+            return orders
+            
+        # Initialize price history for this product if needed
+        if "price_history" not in trader_data:
+            trader_data["price_history"] = {}
+            
+        if product not in trader_data["price_history"]:
+            trader_data["price_history"][product] = []
+            
+        order_depth = state.order_depths[product]
+        
+        # Skip if market is one-sided
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return orders
+            
+        # Get market data
+        best_bid = max(order_depth.buy_orders.keys())
+        best_ask = min(order_depth.sell_orders.keys())
+        best_bid_volume = order_depth.buy_orders[best_bid]
+        best_ask_volume = order_depth.sell_orders[best_ask]
+        mid_price = (best_bid + best_ask) / 2
+        
+        # Get current position
+        current_position = state.position.get(product, 0)
+        position_limit = self.LIMIT[product]
+        
+        # Calculate available room to trade
+        room_to_buy = position_limit - current_position
+        room_to_sell = position_limit + current_position
+        
+        # Update price history
+        trader_data["price_history"][product].append(mid_price)
+        
+        # Set window size for SQUID_INK
+        window_size = self.params[Product.SQUID_INK]["window_size"]
+        
+        # Trim price history to window size
+        if len(trader_data["price_history"][product]) > window_size:
+            trader_data["price_history"][product] = trader_data["price_history"][product][-window_size:]
+            
+        # SQUID_INK strategy - mean reversion with volatility awareness
+        if len(trader_data["price_history"][product]) >= 20:
+            moving_avg = statistics.mean(trader_data["price_history"][product])
+            std_dev = statistics.stdev(trader_data["price_history"][product]) if len(trader_data["price_history"][product]) > 1 else 0
+            
+            # Skip if no meaningful statistics
+            if std_dev == 0:
+                return orders
+            
+            # Analyze recent volatility (last 20 vs previous 20)
+            if len(trader_data["price_history"][product]) >= 40:
+                recent_prices = trader_data["price_history"][product][-20:]
+                previous_prices = trader_data["price_history"][product][-40:-20]
+                recent_std_dev = statistics.stdev(recent_prices)
+                previous_std_dev = statistics.stdev(previous_prices)
+                
+                # If recent volatility is increasing rapidly, be more cautious
+                volatility_change = recent_std_dev / previous_std_dev if previous_std_dev > 0 else 1.0
+                
+                # Adjust std_multiplier based on volatility trend
+                std_multiplier = 1.5
+                if volatility_change > 1.5:
+                    # Volatility increasing - widen bands
+                    std_multiplier = 1.75
+                elif volatility_change < 0.7:
+                    # Volatility decreasing - narrow bands
+                    std_multiplier = 1.25
+            else:
+                std_multiplier = 1.5
+            
+            # Calculate order book imbalance
+            total_bid_volume = sum(-qty for qty in order_depth.buy_orders.values())
+            total_ask_volume = sum(qty for qty in order_depth.sell_orders.values())
+            
+            book_imbalance = 0
+            if total_bid_volume + total_ask_volume > 0:
+                book_imbalance = (total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume)
+            
+            # Adjust thresholds based on order book imbalance
+            imbalance_adjustment = 0.2 * std_dev * book_imbalance
+            
+            upper_threshold = moving_avg + (std_multiplier * std_dev) + imbalance_adjustment
+            lower_threshold = moving_avg - (std_multiplier * std_dev) + imbalance_adjustment
+            
+            logger.print(f"SQUID_INK: Price={mid_price:.2f}, MA={moving_avg:.2f}, StdDev={std_dev:.2f}, Imbalance={book_imbalance:.2f}, StdMult={std_multiplier:.2f}")
+            
+            # Trading logic with aggressive mean reversion
+            if mid_price > upper_threshold:
+                # Calculate deviation in std dev units
+                deviation = (mid_price - moving_avg) / std_dev
+                
+                # More aggressive for larger deviations, but cap at 1.0
+                position_scalar = min(1.0, 0.4 + deviation * 0.25)
+                
+                # Consider current position in decision - reduce size when we already have a large position
+                position_factor = max(0.2, 1.0 - (current_position / position_limit) * 0.7)
+                
+                sell_quantity = min(best_bid_volume, math.ceil(room_to_sell * position_scalar * position_factor))
+                
+                if sell_quantity > 0:
+                    logger.print(f"SQUID_INK: SELL {sell_quantity}x {best_bid} (high price, deviation: {deviation:.2f})")
+                    orders.append(Order(product, best_bid, -sell_quantity))
+            
+            elif mid_price < lower_threshold:
+                # Calculate deviation in std dev units
+                deviation = (moving_avg - mid_price) / std_dev
+                
+                # More aggressive for larger deviations, but cap at 1.0
+                position_scalar = min(1.0, 0.4 + deviation * 0.25)
+                
+                # Consider current position in decision - reduce size when we already have a large position
+                position_factor = max(0.2, 1.0 + (current_position / position_limit) * 0.7)
+                
+                buy_quantity = min(-best_ask_volume, math.ceil(room_to_buy * position_scalar * position_factor))
+                
+                if buy_quantity > 0:
+                    logger.print(f"SQUID_INK: BUY {buy_quantity}x {best_ask} (low price, deviation: {deviation:.2f})")
+                    orders.append(Order(product, best_ask, buy_quantity))
+        
+        return orders
+
     def run(self, state: TradingState):
-        traderObject = {}
-        if state.traderData != None and state.traderData != "":
-            traderObject = jsonpickle.decode(state.traderData)
-
+        # Initialize trader data
+        trader_data = {}
+        if state.traderData:
+            try:
+                if state.traderData.startswith("{"):  # Check if it's JSON
+                    trader_data = json.loads(state.traderData)
+                else:
+                    trader_data = jsonpickle.decode(state.traderData)
+            except:
+                # If there's an error, start with a fresh trader_data
+                trader_data = {}
+        
         result = {}
+        conversions = 0
 
+        # Handle SQUID_INK trading
+        if Product.SQUID_INK in state.order_depths:
+            squid_ink_orders = self.trade_squid_ink(state, trader_data)
+            if squid_ink_orders:
+                result[Product.SQUID_INK] = squid_ink_orders
+
+        # Handle RAINFOREST_RESIN trading
         if Product.RAINFOREST_RESIN in self.params and Product.RAINFOREST_RESIN in state.order_depths:
             rainforest_resin_position = (
                 state.position[Product.RAINFOREST_RESIN]
@@ -506,6 +654,7 @@ class Trader:
                 rainforest_resin_take_orders + rainforest_resin_clear_orders + rainforest_resin_make_orders
             )
 
+        # Handle KELP trading
         if Product.KELP in self.params and Product.KELP in state.order_depths:
             KELP_position = (
                 state.position[Product.KELP]
@@ -513,7 +662,7 @@ class Trader:
                 else 0
             )
             KELP_fair_value = self.KELP_fair_value(
-                state.order_depths[Product.KELP], traderObject
+                state.order_depths[Product.KELP], trader_data
             )
             KELP_take_orders, buy_order_volume, sell_order_volume = (
                 self.take_orders(
@@ -552,9 +701,14 @@ class Trader:
                 KELP_take_orders + KELP_clear_orders + KELP_make_orders
             )
 
-
+        # Save trader data - decide whether to use json or jsonpickle based on input format
+        if state.traderData and state.traderData.startswith("{"):
+            traderData = json.dumps(trader_data)
+        else:
+            traderData = jsonpickle.encode(trader_data)
+            
+        # Default conversions to 1 as in the original KELP/RAINFOREST_RESIN strategy
         conversions = 1
-        traderData = jsonpickle.encode(traderObject)
+        
         logger.flush(state, result, conversions, traderData)
-
         return result, conversions, traderData
